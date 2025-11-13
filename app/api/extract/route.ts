@@ -10,7 +10,10 @@ import {
   OutputType,
   View,
   Region,
-  Manifest
+  Manifest,
+  ManifestResources,
+  ObjectTree,
+  Properties
 } from "@aps_sdk/model-derivative"
 
 // Configure route for Node.js runtime and longer execution time
@@ -18,6 +21,28 @@ export const runtime = 'nodejs'
 export const maxDuration = 300 // 5 minutes for large/complex files
 
 let cachedToken: { token: string; expiresAt: number } | null = null
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+async function pollForResult<T>(
+  fetcher: () => Promise<T>,
+  isReady: (result: T | null) => boolean,
+  options?: { attempts?: number; delayMs?: number }
+): Promise<{ result: T | null; ready: boolean }> {
+  const attempts = options?.attempts ?? 8
+  const delayMs = options?.delayMs ?? 2000
+  let lastResult: T | null = null
+
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    lastResult = await fetcher()
+    if (isReady(lastResult)) {
+      return { result: lastResult, ready: true }
+    }
+    await sleep(delayMs)
+  }
+
+  return { result: lastResult, ready: false }
+}
 
 async function getAccessToken(): Promise<string> {
   const clientId = process.env.APS_CLIENT_ID
@@ -116,6 +141,70 @@ async function getMetadata(mdClient: ModelDerivativeClient, urn: string): Promis
   const maxAttempts = 60 // 60 attempts × 2 seconds = 2 minutes of polling
   const delayMs = 2000
   let lastStatus = ""
+  const stringToBoolean = (value: any) => value === true || value === "true"
+  const analyzeObjectTree = (nodes: any[] | undefined) => {
+    if (!nodes || nodes.length === 0) {
+      return { nodeCount: 0, maxDepth: 0 }
+    }
+
+    let nodeCount = 0
+    let maxDepth = 0
+
+    const traverse = (items: any[], depth: number) => {
+      for (const item of items) {
+        nodeCount++
+        if (depth > maxDepth) {
+          maxDepth = depth
+        }
+        if (item.objects && item.objects.length > 0) {
+          traverse(item.objects, depth + 1)
+        }
+      }
+    }
+
+    traverse(nodes, 1)
+    return { nodeCount, maxDepth }
+  }
+  const summarizeProperties = (collection: any[] | undefined) => {
+    if (!collection || collection.length === 0) {
+      return { objectCount: 0, categoryCount: 0, propertyCount: 0 }
+    }
+
+    const categories = new Set<string>()
+    let propertyCount = 0
+
+    for (const entry of collection) {
+      const props = entry?.properties || {}
+      for (const category of Object.keys(props)) {
+        categories.add(category)
+        const categoryProps = props[category]
+        if (categoryProps && typeof categoryProps === "object") {
+          propertyCount += Object.keys(categoryProps).length
+        }
+      }
+    }
+
+    return {
+      objectCount: collection.length,
+      categoryCount: categories.size,
+      propertyCount,
+    }
+  }
+  const addResourcesToMap = (resources: ManifestResources[] | undefined, map: Map<string, ManifestResources>) => {
+    if (!resources) {
+      return
+    }
+
+    for (const resource of resources) {
+      if (resource.guid) {
+        map.set(resource.guid, resource)
+      }
+
+      if (resource.children && resource.children.length > 0) {
+        addResourcesToMap(resource.children as ManifestResources[], map)
+      }
+    }
+  }
 
   while (attempts < maxAttempts) {
     try {
@@ -158,28 +247,51 @@ async function getMetadata(mdClient: ModelDerivativeClient, urn: string): Promis
         console.log("Warning: Job succeeded but no derivatives found. Returning manifest info.")
         return {
           fileName: "",
+          sourceUrn: manifest.urn,
           status: manifest.status,
           progress: manifest.progress,
-          hasThumbnail: manifest.hasThumbnail,
+          region: manifest.region,
+          hasThumbnail: stringToBoolean(manifest.hasThumbnail),
           derivatives: [],
           message: "File processed but no derivatives generated. This may be expected for simple files."
         }
       }
 
+      const resourceMap = new Map<string, ManifestResources>()
+      for (const derivative of derivatives) {
+        addResourcesToMap(derivative.children as ManifestResources[] | undefined, resourceMap)
+      }
+
       const metadata: any = {
-        fileName: "",
+        fileName: derivatives[0]?.name || "",
+        sourceUrn: manifest.urn,
         status: manifest.status,
         progress: manifest.progress,
-        hasThumbnail: manifest.hasThumbnail,
+        region: manifest.region,
+        hasThumbnail: stringToBoolean(manifest.hasThumbnail),
         derivatives: [],
       }
 
       for (const derivative of derivatives) {
+        const derivativeResources =
+          derivative.children?.map((resource: ManifestResources) => ({
+            guid: resource.guid,
+            name: resource.name,
+            type: resource.type,
+            urn: resource.urn,
+            role: resource.role,
+            viewableID: resource.viewableID,
+            hasThumbnail: stringToBoolean(resource.hasThumbnail),
+            progress: resource.progress,
+          })) || []
+
         metadata.derivatives.push({
           name: derivative.name,
-          hasThumbnail: derivative.hasThumbnail,
+          hasThumbnail: stringToBoolean(derivative.hasThumbnail),
           outputType: derivative.outputType,
           role: derivative.role,
+          status: derivative.status,
+          resources: derivativeResources,
         })
       }
 
@@ -191,7 +303,71 @@ async function getMetadata(mdClient: ModelDerivativeClient, urn: string): Promis
             guid: view.guid,
             name: view.name,
             role: view.role,
+            urn: resourceMap.get(view.guid)?.urn,
+            viewableID: resourceMap.get(view.guid)?.viewableID,
           }))
+
+          for (const view of metadata.modelViews) {
+            // Object tree enrichment with polling
+            view.objectTreeStatus = "pending"
+            try {
+              const { result: objectTreeResult, ready: isTreeReady } = await pollForResult(
+                () =>
+                  mdClient.getObjectTree(urn, view.guid, {
+                    region: Region.Us,
+                    forceget: "true",
+                    acceptEncoding: "gzip",
+                  }),
+                (result) => Boolean(result && (result as ObjectTree).isProcessing !== true && (result as any)?.data),
+                { attempts: 10, delayMs: 2000 }
+              )
+
+              if (objectTreeResult?.data) {
+                view.objectTree = objectTreeResult.data
+                view.objectTreeStats = analyzeObjectTree(objectTreeResult.data.objects)
+              }
+
+              view.objectTreeStatus = isTreeReady
+                ? "complete"
+                : objectTreeResult?.isProcessing
+                ? "processing"
+                : "unavailable"
+            } catch (treeError: any) {
+              console.log(`Failed to fetch object tree for view ${view.guid}:`, treeError)
+              view.objectTreeStatus = "error"
+              view.objectTreeError = treeError?.message || "Failed to fetch object tree"
+            }
+
+            // Properties enrichment with polling
+            view.propertiesStatus = "pending"
+            try {
+              const { result: propertiesResult, ready: arePropertiesReady } = await pollForResult(
+                () =>
+                  mdClient.getAllProperties(urn, view.guid, {
+                    region: Region.Us,
+                    forceget: "true",
+                    acceptEncoding: "gzip",
+                  }),
+                (result) => Boolean(result && (result as Properties).isProcessing !== true && (result as any)?.data),
+                { attempts: 10, delayMs: 2000 }
+              )
+
+              if (propertiesResult?.data) {
+                view.properties = propertiesResult.data
+                view.propertiesStats = summarizeProperties(propertiesResult.data.collection)
+              }
+
+              view.propertiesStatus = arePropertiesReady
+                ? "complete"
+                : propertiesResult?.isProcessing
+                ? "processing"
+                : "unavailable"
+            } catch (propError: any) {
+              console.log(`Failed to fetch properties for view ${view.guid}:`, propError)
+              view.propertiesStatus = "error"
+              view.propertiesError = propError?.message || "Failed to fetch properties"
+            }
+          }
         }
       } catch (err) {
         console.log("Failed to fetch model views:", err)
@@ -269,6 +445,11 @@ export async function POST(request: NextRequest) {
 
     // Get metadata
     const metadata = await getMetadata(mdClient, urn)
+    metadata.originalFileName = file.name
+    metadata.sourceUrn = metadata.sourceUrn || urn
+    metadata.translationUrn = urn
+    metadata.bucketKey = bucketKey
+    metadata.objectKey = objectKey
     console.log("Metadata extracted successfully")
 
     return NextResponse.json({ metadata })
