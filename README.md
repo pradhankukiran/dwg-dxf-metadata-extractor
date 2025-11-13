@@ -2,7 +2,6 @@
 
 Extract metadata from DWG and DXF files using Autodesk Platform Services (APS).
 
-[![Deployed on Vercel](https://img.shields.io/badge/Deployed%20on-Vercel-black?style=for-the-badge&logo=vercel)](https://vercel.com/pradhankukiran-projects/v0-dwg-dxf-metadata-extractor)
 
 ## Overview
 
