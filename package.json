@@ -1,5 +1,5 @@
 {
-  "name": "my-v0-project",
+  "name": "dwg-dxf-metadata-extractor",
   "version": "0.1.0",
   "private": true,
   "scripts": {
@@ -9,6 +9,10 @@
     "start": "next start"
   },
   "dependencies": {
+    "@aps_sdk/authentication": "^1.0.0",
+    "@aps_sdk/autodesk-sdkmanager": "^1.0.0",
+    "@aps_sdk/model-derivative": "^1.2.0",
+    "@aps_sdk/oss": "^1.2.2",
     "@hookform/resolvers": "^3.10.0",
     "@radix-ui/react-accordion": "1.2.2",
     "@radix-ui/react-alert-dialog": "1.1.4",
@@ -57,7 +61,7 @@
     "sonner": "^1.7.4",
     "tailwind-merge": "^2.5.5",
     "tailwindcss-animate": "^1.0.7",
-    "vaul": "^0.9.9",
+    "vaul": "^1.1.2",
     "zod": "3.25.76"
   },
   "devDependencies": {
@@ -68,6 +72,7 @@
     "postcss": "^8.5",
     "tailwindcss": "^4.1.9",
     "tw-animate-css": "1.3.3",
-    "typescript": "^5"
-  }
+    "typescript": "^5.9.3"
+  },
+  "packageManager": "pnpm@10.22.0+sha512.bf049efe995b28f527fd2b41ae0474ce29186f7edcb3bf545087bd61fbbebb2bf75362d1307fda09c2d288e1e499787ac12d4fcb617a974718a6051f2eee741c"
 }

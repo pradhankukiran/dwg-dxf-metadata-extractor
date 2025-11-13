@@ -1,8 +1,21 @@
 import { type NextRequest, NextResponse } from "next/server"
+import { StaticAuthenticationProvider } from "@aps_sdk/autodesk-sdkmanager"
+import { AuthenticationClient, Scopes } from "@aps_sdk/authentication"
+import { OssClient } from "@aps_sdk/oss"
+import {
+  ModelDerivativeClient,
+  JobPayload,
+  JobPayloadInput,
+  JobPayloadOutput,
+  OutputType,
+  View,
+  Region,
+  Manifest
+} from "@aps_sdk/model-derivative"
 
-const APS_AUTH_URL = "https://developer.api.autodesk.com/authentication/v2/token"
-const APS_MODEL_DERIVATIVE_URL = "https://developer.api.autodesk.com/modelderivative/v2"
-const APS_OSS_URL = "https://developer.api.autodesk.com/oss/v2"
+// Configure route for Node.js runtime and longer execution time
+export const runtime = 'nodejs'
+export const maxDuration = 300 // 5 minutes for large/complex files
 
 let cachedToken: { token: string; expiresAt: number } | null = null
 
@@ -19,169 +32,145 @@ async function getAccessToken(): Promise<string> {
     return cachedToken.token
   }
 
-  const response = await fetch(APS_AUTH_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    body: new URLSearchParams({
-      client_id: clientId,
-      client_secret: clientSecret,
-      grant_type: "client_credentials",
-      scope: "data:read data:create bucket:read bucket:create",
-    }).toString(),
-  })
+  const authClient = new AuthenticationClient()
+  const credentials = await authClient.getTwoLeggedToken(
+    clientId,
+    clientSecret,
+    [Scopes.DataRead, Scopes.DataCreate, Scopes.BucketRead, Scopes.BucketCreate]
+  )
 
-  if (!response.ok) {
-    throw new Error("Failed to authenticate with APS")
-  }
-
-  const data = (await response.json()) as any
   cachedToken = {
-    token: data.access_token,
-    expiresAt: Date.now() + data.expires_in * 1000 - 60000,
+    token: credentials.access_token,
+    expiresAt: Date.now() + credentials.expires_in * 1000 - 60000,
   }
 
-  return data.access_token
+  return credentials.access_token
 }
 
-async function ensureBucketExists(token: string, bucketKey: string): Promise<void> {
-  console.log("[v0] Ensuring bucket exists:", bucketKey)
+async function ensureBucketExists(ossClient: OssClient, bucketKey: string): Promise<void> {
+  console.log("Checking bucket:", bucketKey)
 
-  const createBucketResponse = await fetch(`${APS_OSS_URL}/buckets`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
+  try {
+    await ossClient.createBucket("US", {
       bucketKey,
       policyKey: "transient",
-    }),
-  })
-
-  // 409 means bucket already exists, which is fine
-  if (createBucketResponse.status === 409) {
-    console.log("[v0] Bucket already exists")
-    return
+    })
+    console.log("Bucket created successfully")
+  } catch (error: any) {
+    // 409 means bucket already exists, which is fine
+    const status = error?.axiosError?.response?.status || error?.response?.status || error?.status || error?.statusCode
+    if (status === 409) {
+      console.log("Bucket already exists (this is normal)")
+      return
+    }
+    console.error("Failed to create bucket:", error.message || error)
+    throw error
   }
-
-  if (!createBucketResponse.ok) {
-    const errorText = await createBucketResponse.text()
-    console.log("[v0] Bucket creation error:", createBucketResponse.status, errorText)
-    throw new Error(`Failed to create or verify bucket: ${createBucketResponse.status} - ${errorText}`)
-  }
-
-  console.log("[v0] Bucket created successfully")
 }
 
 async function uploadToOSS(
-  token: string,
+  ossClient: OssClient,
   bucketKey: string,
   objectKey: string,
   fileBuffer: Buffer,
-  fileName: string,
 ): Promise<void> {
-  console.log("[v0] Uploading file to OSS:", objectKey)
+  console.log("Uploading file to OSS:", objectKey)
 
-  const uploadResponse = await fetch(`${APS_OSS_URL}/buckets/${bucketKey}/objects/${encodeURIComponent(objectKey)}`, {
-    method: "PUT",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/octet-stream",
-      "Content-Length": fileBuffer.length.toString(),
-    },
-    body: fileBuffer,
-  })
+  await ossClient.uploadObject(bucketKey, objectKey, fileBuffer)
 
-  if (!uploadResponse.ok) {
-    const errorText = await uploadResponse.text()
-    console.log("[v0] Upload error:", uploadResponse.status, errorText)
-    throw new Error(`Failed to upload file to OSS: ${uploadResponse.status} - ${errorText}`)
-  }
-
-  console.log("[v0] File uploaded successfully:", objectKey)
+  console.log("File uploaded successfully:", objectKey)
 }
 
-async function submitTranslationJob(token: string, bucketKey: string, objectKey: string): Promise<string> {
+async function submitTranslationJob(mdClient: ModelDerivativeClient, bucketKey: string, objectKey: string, fileName: string): Promise<string> {
   const urn = Buffer.from(`urn:adsk.objects:os.object:${bucketKey}/${objectKey}`).toString("base64")
 
-  console.log("[v0] Submitting translation job with URN:", urn)
+  console.log("Submitting translation job with URN:", urn)
+  console.log("File type:", fileName.toLowerCase().endsWith('.dxf') ? 'DXF' : 'DWG')
 
-  const response = await fetch(`${APS_MODEL_DERIVATIVE_URL}/designdata/job`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      input: {
-        urn,
-      },
-      output: {
-        formats: [
-          {
-            type: "metadata",
-          },
-        ],
-      },
-    }),
-  })
-
-  if (!response.ok) {
-    const error = await response.text()
-    console.log("[v0] Translation job error:", response.status, error)
-    throw new Error(`Failed to submit translation job: ${response.status} - ${error}`)
+  const jobPayload: JobPayload = {
+    input: {
+      urn: urn,
+      compressedUrn: false,
+      // Explicitly set root filename for better DXF support
+      rootFilename: fileName,
+    } as JobPayloadInput,
+    output: {
+      formats: [
+        {
+          type: OutputType.Svf2,
+          views: [View._2d, View._3d],
+        },
+      ],
+    } as JobPayloadOutput,
   }
 
-  const jobData = (await response.json()) as any
-  console.log("[v0] Job submitted successfully, URN:", jobData.urn)
+  const job = await mdClient.startJob(jobPayload)
 
-  return jobData.urn || urn
+  console.log("Job submitted successfully, URN:", job.urn)
+
+  return job.urn
 }
 
-async function getMetadata(token: string, urn: string): Promise<any> {
+async function getMetadata(mdClient: ModelDerivativeClient, urn: string): Promise<any> {
   let attempts = 0
-  const maxAttempts = 15
+  const maxAttempts = 60 // 60 attempts × 2 seconds = 2 minutes of polling
   const delayMs = 2000
+  let lastStatus = ""
 
   while (attempts < maxAttempts) {
     try {
-      const manifestResponse = await fetch(`${APS_MODEL_DERIVATIVE_URL}/designdata/${urn}/manifest`, {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-      })
+      const manifest: Manifest = await mdClient.getManifest(urn, { region: Region.Us })
 
-      if (!manifestResponse.ok) {
-        if (manifestResponse.status === 404) {
-          console.log("[v0] Waiting for job to complete, attempt", attempts + 1)
-          await new Promise((resolve) => setTimeout(resolve, delayMs))
-          attempts++
-          continue
-        }
-        throw new Error(`Manifest error: ${manifestResponse.status}`)
-      }
+      console.log(`Manifest check ${attempts + 1}/${maxAttempts}, status: ${manifest.status}`)
+      lastStatus = manifest.status
 
-      const manifest = (await manifestResponse.json()) as any
-      console.log("[v0] Manifest received, status:", manifest.status)
-
-      if (manifest.status === "inprogress") {
-        console.log("[v0] Job still in progress")
+      if (manifest.status === "inprogress" || manifest.status === "pending") {
+        console.log("Job still in progress, status:", manifest.status)
         await new Promise((resolve) => setTimeout(resolve, delayMs))
         attempts++
         continue
       }
 
+      if (manifest.status === "failed") {
+        // Log full manifest for debugging
+        console.log("Failed manifest:", JSON.stringify(manifest, null, 2))
+
+        // Extract failure details from manifest
+        const messages = manifest.messages || []
+        const derivatives = manifest.derivatives || []
+
+        // Check derivatives for error messages
+        let errorDetails = ""
+        if (messages.length > 0) {
+          errorDetails = messages.map((msg: any) => msg.message || msg.code).join("; ")
+        } else if (derivatives.length > 0 && derivatives[0].messages) {
+          errorDetails = derivatives[0].messages.map((msg: any) => msg.message || msg.code).join("; ")
+        }
+
+        throw new Error(
+          `Translation job failed. ${errorDetails || "The file may be corrupted, in an unsupported format, or DXF version is not supported by Autodesk Model Derivative API."}`
+        )
+      }
+
       const derivatives = manifest.derivatives || []
       if (derivatives.length === 0) {
-        throw new Error("No derivatives found in manifest")
+        // Job succeeded but no derivatives - this might be normal for some files
+        console.log("Warning: Job succeeded but no derivatives found. Returning manifest info.")
+        return {
+          fileName: "",
+          status: manifest.status,
+          progress: manifest.progress,
+          hasThumbnail: manifest.hasThumbnail,
+          derivatives: [],
+          message: "File processed but no derivatives generated. This may be expected for simple files."
+        }
       }
 
       const metadata: any = {
         fileName: "",
         status: manifest.status,
         progress: manifest.progress,
+        hasThumbnail: manifest.hasThumbnail,
         derivatives: [],
       }
 
@@ -192,76 +181,99 @@ async function getMetadata(token: string, urn: string): Promise<any> {
           outputType: derivative.outputType,
           role: derivative.role,
         })
+      }
 
-        // Try to fetch metadata files if available
-        if (derivative.children) {
-          for (const child of derivative.children) {
-            if (child.role === "Metadata") {
-              try {
-                const metadataResponse = await fetch(child.href, {
-                  headers: {
-                    Authorization: `Bearer ${token}`,
-                  },
-                })
-
-                if (metadataResponse.ok) {
-                  const metadataContent = await metadataResponse.json()
-                  metadata.details = metadataContent
-                }
-              } catch (err) {
-                console.log("[v0] Failed to fetch metadata details:", err)
-              }
-            }
-          }
+      // Try to fetch model views for additional metadata
+      try {
+        const modelViews = await mdClient.getModelViews(urn)
+        if (modelViews?.data?.metadata) {
+          metadata.modelViews = modelViews.data.metadata.map((view: any) => ({
+            guid: view.guid,
+            name: view.name,
+            role: view.role,
+          }))
         }
+      } catch (err) {
+        console.log("Failed to fetch model views:", err)
       }
 
       return metadata
-    } catch (err) {
-      console.log("[v0] Error in getMetadata:", err)
+    } catch (err: any) {
+      if (err?.response?.status === 404 || err?.statusCode === 404) {
+        console.log("Waiting for job to complete, attempt", attempts + 1)
+        await new Promise((resolve) => setTimeout(resolve, delayMs))
+        attempts++
+        continue
+      }
+      console.log("Error in getMetadata:", err)
       throw err
     }
   }
 
-  throw new Error("Metadata extraction timed out after multiple attempts")
+  throw new Error(
+    `Metadata extraction timed out after ${maxAttempts * delayMs / 1000} seconds. ` +
+    `Last status: ${lastStatus}. The file may need more processing time - try again in a few minutes.`
+  )
 }
 
 export async function POST(request: NextRequest) {
   try {
-    const formData = await request.formData()
+    console.log("Parsing request body...")
+
+    let formData: FormData
+    try {
+      formData = await request.formData()
+    } catch (formDataError) {
+      console.error("FormData parsing error:", formDataError)
+      return NextResponse.json(
+        { error: `Failed to parse form data: ${formDataError instanceof Error ? formDataError.message : 'Unknown error'}` },
+        { status: 400 }
+      )
+    }
+
     const file = formData.get("file") as File
 
     if (!file) {
       return NextResponse.json({ error: "No file provided" }, { status: 400 })
     }
 
-    console.log("[v0] Processing file:", file.name, "Size:", file.size)
+    console.log("Processing file:", file.name, "Size:", file.size, "bytes")
     const arrayBuffer = await file.arrayBuffer()
     const fileBuffer = Buffer.from(arrayBuffer)
 
     const token = await getAccessToken()
+
+    // Initialize clients with authentication provider
+    const authProvider = new StaticAuthenticationProvider(token)
+    const ossClient = new OssClient({ authenticationProvider: authProvider })
+    const mdClient = new ModelDerivativeClient({ authenticationProvider: authProvider })
+
     const timestamp = Date.now()
     const bucketKey = "dwg-extractor-bucket"
-    const objectKey = `${timestamp}-${file.name}`
 
-    console.log("[v0] Starting extraction for:", file.name)
+    // Sanitize filename: replace spaces and special chars with underscores
+    const sanitizedFileName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_')
+    const objectKey = `${timestamp}-${sanitizedFileName}`
+
+    console.log("Starting extraction for:", file.name)
+    console.log("Object key:", objectKey)
 
     // Ensure bucket exists
-    await ensureBucketExists(token, bucketKey)
+    await ensureBucketExists(ossClient, bucketKey)
 
     // Upload file to OSS
-    await uploadToOSS(token, bucketKey, objectKey, fileBuffer, file.name)
+    await uploadToOSS(ossClient, bucketKey, objectKey, fileBuffer)
 
     // Submit translation job
-    const urn = await submitTranslationJob(token, bucketKey, objectKey)
+    const urn = await submitTranslationJob(mdClient, bucketKey, objectKey, file.name)
 
     // Get metadata
-    const metadata = await getMetadata(token, urn)
-    console.log("[v0] Metadata extracted successfully")
+    const metadata = await getMetadata(mdClient, urn)
+    console.log("Metadata extracted successfully")
 
     return NextResponse.json({ metadata })
   } catch (error) {
-    console.error("[v0] Error:", error)
+    console.error("Error:", error)
     return NextResponse.json({ error: error instanceof Error ? error.message : "An error occurred" }, { status: 500 })
   }
 }
