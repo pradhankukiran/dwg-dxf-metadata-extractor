@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./.github/assets/repo-mark.svg" alt="DWG/DXF Metadata Extractor logo" width="96" />
+  <img src="./public/favicon.svg" alt="DWG/DXF Metadata Extractor favicon" width="72" />
 </p>
 
 <h1 align="center">DWG/DXF Metadata Extractor</h1>
@@ -36,10 +36,6 @@
   <a href="#quick-start">Quick Start</a> |
   <a href="#api">API</a> |
   <a href="#project-structure">Project Structure</a>
-</p>
-
-<p align="center">
-  <img src="./.github/assets/repo-banner.svg" alt="DWG/DXF Metadata Extractor banner" width="100%" />
 </p>
 
 ## Highlights
